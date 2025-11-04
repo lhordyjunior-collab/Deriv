@@ -1,0 +1,115 @@
+"""
+Deriv sniper bot prototype (DEMO FIRST).
+- Verify API field names for your Deriv account and adapt if needed.
+- This code assumes typical Deriv v3 fields: authorize, ticks, proposal, buy.
+- Test on Deriv demo account before any real money.
+"""
+
+import json
+import time
+import threading
+import websocket
+import requests
+import math
+import signal
+from collections import deque
+
+# -----------------------
+# CONFIG - edit these
+# -----------------------
+CONFIG = {
+    "api_token": "YOUR_DERIV_API_TOKEN",   # Use demo token first
+    "app_id": 1089,                        # typical example app_id; change if needed
+    "symbol": "R_100",                     # example synthetic index (change to the market you want)
+    "tick_duration": 1,                    # duration in ticks for contract (1 = 1 tick)
+    "contract_ticks": 1,                   # place 1-tick or 3-tick contracts
+    "stake_percent": 0.5,                  # stake as percent of account balance (0.5 = 0.5%)
+    "max_consecutive_losses": 6,           # stop strategy after X consecutive losses
+    "daily_max_loss_percent": 5.0,         # stop trading if you lose this % of starting balance for the session
+    "min_acc_balance": 1.0,                # minimum balance to keep > 0
+    "ema_fast_period": 3,                  # short EMA
+    "ema_slow_period": 8,                  # longer EMA
+    "volatility_lookback": 8,              # lookback ticks for volatility metric
+    "volatility_threshold": 0.0009,        # change threshold to tune — relative price move to trigger
+    "demo_mode": True,
+    "logfile": "sniper_log.txt",
+    "cooldown_after_loss_secs": 2,         # cooldown after a losing trade
+}
+
+# -----------------------
+# Globals / state
+# -----------------------
+WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={CONFIG['app_id']}"
+if CONFIG["api_token"]:
+    AUTH_PAYLOAD = {"authorize": CONFIG["api_token"]}
+else:
+    AUTH_PAYLOAD = None
+
+running = True
+tick_queue = deque(maxlen=200)  # store last N prices with timestamps
+ema_fast = None
+ema_slow = None
+consecutive_losses = 0
+session_start_balance = None
+session_balance = None
+trade_counter = 0
+lock = threading.Lock()
+
+# Logging helper
+def log(msg):
+    t = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{t}] {msg}"
+    print(line)
+    with open(CONFIG["logfile"], "a") as f:
+        f.write(line + "\n")
+
+# -----------------------
+# EMA helpers
+# -----------------------
+def calc_ema(prev_ema, price, period):
+    alpha = 2.0 / (period + 1)
+    if prev_ema is None:
+        return price
+    return (price - prev_ema) * alpha + prev_ema
+
+# -----------------------
+# Risk / stake sizing
+# -----------------------
+def compute_stake(balance):
+    # stake percent of balance, round to 2 decimals, min 0.5
+    stake = max(0.01, (CONFIG["stake_percent"] / 100.0) * balance)
+    # Round to 2 decimal places typical for synthetic indices
+    stake = round(stake, 2)
+    return stake
+
+# -----------------------
+# Trading logic: sniper signal
+# - Look for consolidation then a volatility spike and EMA alignment
+# - On spike direction, place 1-tick CALL or PUT
+# -----------------------
+def detect_sniper_signal():
+    if len(tick_queue) < max(CONFIG["ema_slow_period"], CONFIG["volatility_lookback"]) + 2:
+        return None
+
+    prices = [p for (_, p) in tick_queue]
+    last_price = prices[-1]
+    prev_price = prices[-2]
+
+    # Update EMAs (we compute incremental outside too)
+    global ema_fast, ema_slow
+    ema_fast = calc_ema(ema_fast, last_price, CONFIG["ema_fast_period"])
+    ema_slow = calc_ema(ema_slow, last_price, CONFIG["ema_slow_period"])
+
+    # volatility = stddev of returns over lookback window
+    lookback = CONFIG["volatility_lookback"]
+    window = prices[-(lookback + 1):]
+    returns = []
+    for i in range(1, len(window)):
+        if window[i-1] == 0:
+            returns.append(0)
+        else:
+            returns.append(abs(window[i] - window[i-1]) / window[i-1])
+    vol = sum(returns) / len(returns) if len(returns) else 0
+
+    # immediate tick move
+    immediate_move = (last_price - prev_price) /_
